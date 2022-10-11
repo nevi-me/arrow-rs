@@ -93,10 +93,10 @@ const INVALID: &AsciiSet = &CONTROLS
     .add(b'}')
     .add(b'%')
     .add(b'`')
-    .add(b']')
+    // .add(b']')
     .add(b'"') // " <-- my editor is confused about double quotes within single quotes
     .add(b'>')
-    .add(b'[')
+    // .add(b'[')
     .add(b'~')
     .add(b'<')
     .add(b'#')
