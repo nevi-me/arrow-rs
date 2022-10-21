@@ -590,15 +590,18 @@ pub struct Decoder {
     options: DecoderOptions,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// Options for JSON decoding
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecoderOptions {
     /// Batch size (number of records to load each time), defaults to 1024 records
     batch_size: usize,
     /// Optional projection for which columns to load (case-sensitive names)
     projection: Option<Vec<String>>,
-    /// optional HashMap of column name to its format string
+    /// Optional HashMap of column name to its format string
     format_strings: Option<HashMap<String, String>>,
+    /// Optional mode for decimal handling. If not provided, the mode is inferred
+    /// from the first non-null record of the column,
+    decimal_mode: Option<DecimalMode>,
 }
 
 impl Default for DecoderOptions {
@@ -607,6 +610,7 @@ impl Default for DecoderOptions {
             batch_size: 1024,
             projection: None,
             format_strings: None,
+            decimal_mode: None,
         }
     }
 }
@@ -1014,6 +1018,82 @@ impl Decoder {
         ))
     }
 
+    fn build_decimal_array(
+        &self,
+        rows: &[Value],
+        col_name: &str,
+        precision: u8,
+        scale: u8,
+    ) -> Result<ArrayRef> {
+        let decimal_mode = match self.options.decimal_mode {
+            Some(mode) => mode,
+            None => {
+                // Infer the type from the first non-null record
+                let record = rows
+                    .iter()
+                    .filter_map(|value| match value.get(col_name) {
+                        Some(value) => {
+                            if value.is_null() {
+                                None
+                            } else {
+                                Some(value)
+                            }
+                        }
+                        None => None,
+                    })
+                    .take(1)
+                    .collect::<Vec<_>>();
+                if record.is_empty() {
+                    // Default to string mode
+                    DecimalMode::String
+                } else {
+                    let value = &record[0];
+                    if value.is_number() {
+                        DecimalMode::Float
+                    } else {
+                        DecimalMode::String
+                    }
+                    // TODO we could infer other types
+                }
+            }
+        };
+
+        match decimal_mode {
+            DecimalMode::Binary => todo!(),
+            DecimalMode::Bytes => todo!(),
+            DecimalMode::String => {
+                // TODO: which is cheaper, casting to f64 or extracting parts?
+                let mul = 10_f64.powi(scale as i32);
+                Ok(Arc::new(
+                    rows.iter()
+                        .map(|row| {
+                            row.get(&col_name).and_then(|value| {
+                                value
+                                    .as_str()
+                                    .and_then(|v| v.parse::<f64>().ok())
+                                    .map(|v| (v * mul) as i128)
+                            })
+                        })
+                        .collect::<Decimal128Array>()
+                        .with_precision_and_scale(precision, scale)?,
+                ))
+            }
+            DecimalMode::Float => {
+                let mul = 10_f64.powi(scale as i32);
+                Ok(Arc::new(
+                    rows.iter()
+                        .map(|row| {
+                            row.get(&col_name).and_then(|value| {
+                                value.as_f64().map(|v| (v * mul) as i128)
+                            })
+                        })
+                        .collect::<Decimal128Array>()
+                        .with_precision_and_scale(precision, scale)?,
+                ))
+            }
+        }
+    }
+
     /// Build a nested GenericListArray from a list of unnested `Value`s
     fn build_nested_list_array<OffsetSize: OffsetSizeTrait>(
         &self,
@@ -1232,6 +1312,9 @@ impl Decoder {
                     }
                     DataType::UInt8 => {
                         self.build_primitive_array::<UInt8Type>(rows, field.name())
+                    }
+                    DataType::Decimal128(precision, scale) => {
+                        self.build_decimal_array(rows, field.name(), *precision, *scale)
                     }
                     // TODO: this is incomplete
                     DataType::Timestamp(unit, _) => match unit {
@@ -1540,6 +1623,24 @@ impl Decoder {
         let array = values.iter().collect::<PrimitiveArray<T>>();
         array.into_data()
     }
+}
+
+/// The decimal handling mode for [Decimal128Array] and [Decimal256Array].
+///
+/// Systems that convert decimal values to JSON often have a configurable output
+/// which determines how the values are represented.
+/// Bytes/binary and string representations preserve the accuracy of the value,
+/// while float representations can often result in a loss of precision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecimalMode {
+    /// Values stored as binary
+    Binary,
+    /// Data stored as bytes
+    Bytes,
+    /// Data stored as strings, e.g. "123.45"
+    String,
+    /// Data stored as f64
+    Float,
 }
 
 /// Reads a JSON value as a string, regardless of its type.
@@ -2400,6 +2501,31 @@ mod tests {
         assert_eq!(d.data_ref(), read_d.data_ref());
 
         assert_eq!(read.data_ref(), expected.data_ref());
+    }
+
+    #[test]
+    fn test_decimal_json_arrays() {
+        let price_field = Field::new("price", DataType::Decimal128(10, 2), true);
+        let schema = Arc::new(Schema::new(vec![price_field]));
+        let builder = ReaderBuilder::new().with_schema(schema).with_batch_size(64);
+        let json_content = r#"
+        {"price": null}
+        {"price": 123.45}
+        {"price": 456.789}
+        "#;
+        let mut reader = builder.build(Cursor::new(json_content)).unwrap();
+
+        // build expected output
+        let expected_prices = Decimal128Array::from(vec![None, Some(12345), Some(45678)])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+
+        // compare with result from json reader
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 1);
+        let col1 = batch.column(0);
+        assert_eq!(col1.data(), expected_prices.data());
     }
 
     #[test]
